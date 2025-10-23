@@ -4,7 +4,7 @@ Step 5 — Ingest IP-only abuse feeds and count hits per hoster.
 
 Inputs (from pipeline.yaml):
   - feeds_file: path to YAML with a 'feeds:' list of {name, path}
-  - hosters_file: path to hoster/CIDR mapping (MaxMind-derived CSV or pipe)
+  - hosters_file: path to hoster/CIDR mapping (MaxMind-derived CSV/pipe)
   - paths.lmdb_dir: directory for LMDB environment
 
 Also carries forward Step 4 capacity metrics by reading:
@@ -29,8 +29,8 @@ except ImportError:
 
 from hosterbenchmark.feeds.parsers import (
     FEED_REGISTRY,
-    load_hosters,      # returns dict[str, list[str]]  hoster -> [cidrs...]
-    _expand_files,      # glob/dir expansion helper
+    load_hosters,   # returns dict[str, list[str]]  hoster -> [cidrs...]
+    _expand_files,   # glob/dir expansion helper
 )
 from hosterbenchmark.feeds.store import Store, Processor
 
@@ -42,9 +42,9 @@ _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"
 logger.addHandler(_handler)
 
 
-# ---------------------------
+# -------------------------------------------------------------------
 # Helpers
-# ---------------------------
+# -------------------------------------------------------------------
 
 def _load_yaml(fp: str) -> dict:
     if yaml is None:
@@ -59,8 +59,8 @@ def _load_capacity_map(capacity_csv: str) -> Dict[str, dict]:
     when no feeds are ingested.
 
     Returns: { hoster: row_dict }
-    The row_dict includes keys: Organization, domaincount, cidr_count, total_ips,
-    avg_domains_per_ip, cidrs (JSON list as string), etc.
+    Keys typically include: Organization, domaincount, cidr_count, total_ips,
+    avg_domains_per_ip, cidrs (JSON list string), etc.
     """
     out: Dict[str, dict] = {}
     if not capacity_csv or not os.path.isfile(capacity_csv):
@@ -69,10 +69,7 @@ def _load_capacity_map(capacity_csv: str) -> Dict[str, dict]:
     with open(capacity_csv, "r", encoding="utf-8", newline="") as fh:
         rdr = csv.DictReader(fh)
         for r in rdr:
-            org = (r.get("Organization") or "").strip()
-            if not org:
-                # tolerate alternate key name
-                org = (r.get("hoster") or "").strip()
+            org = (r.get("Organization") or r.get("hoster") or "").strip()
             if not org:
                 continue
             out[org] = r
@@ -80,9 +77,9 @@ def _load_capacity_map(capacity_csv: str) -> Dict[str, dict]:
     return out
 
 
-# ---------------------------
+# -------------------------------------------------------------------
 # Core
-# ---------------------------
+# -------------------------------------------------------------------
 
 def ingest_and_export(config_path: str) -> None:
     cfg = _load_yaml(config_path)
@@ -108,22 +105,25 @@ def ingest_and_export(config_path: str) -> None:
     if not feeds_conf:
         raise ValueError("pipeline.yaml missing 'feeds_file'")
 
+    # Load hosters → [cidrs...]
     logger.info("Step 5: loading hosters...")
-    hosters = load_hosters(hosters_file)  # hoster -> [cidrs...]
+    hosters, _meta = load_hosters(hosters_file) if isinstance(load_hosters(hosters_file), tuple) else (load_hosters(hosters_file), {})
     all_hoster_names = list(hosters.keys())
 
     # Carry forward Step 4 capacity (optional but recommended)
     capacity_csv = outputs.get("capacity_csv", "")
     capacity_map = _load_capacity_map(capacity_csv)  # hoster -> row dict (from capacity)
 
+    # Load feed list
     logger.info("Step 5: loading feeds...")
     with open(feeds_conf, "r", encoding="utf-8") as fh:
         feeds_yaml = yaml.safe_load(fh) or {}
     feeds_list = feeds_yaml.get("feeds", []) or []
 
-    # Build list of (feed_name, path) that we can actually run
+    # Build list of (feed_name, path) we can actually run, and derive feed policy
     feed_specs: List[Tuple[str, str]] = []
     feeds_to_report: List[str] = []
+    feed_policy: Dict[str, bool] = {}  # feed_name -> COUNT_DOMAINS (True = supports domain/IP split; False = IP-only)
 
     for item in feeds_list:
         name = item.get("name")
@@ -133,21 +133,44 @@ def ingest_and_export(config_path: str) -> None:
         if name not in FEED_REGISTRY:
             logger.warning(f"Feed '{name}' not in FEED_REGISTRY; skipping")
             continue
+
+        parser_entry = FEED_REGISTRY[name]
+        # Try to get COUNT_DOMAINS flag from class or instance
+        count_domains = True
+        try:
+            # If it's a class or object with attribute
+            if hasattr(parser_entry, "COUNT_DOMAINS"):
+                count_domains = bool(getattr(parser_entry, "COUNT_DOMAINS"))
+            else:
+                # If it's a constructor, instantiate to inspect
+                maybe_inst = parser_entry() if callable(parser_entry) else parser_entry
+                if hasattr(maybe_inst, "COUNT_DOMAINS"):
+                    count_domains = bool(getattr(maybe_inst, "COUNT_DOMAINS"))
+        except Exception:
+            pass
+
+        feed_policy[name] = count_domains
         feed_specs.append((name, path))
         feeds_to_report.append(name)
 
     logger.info("Step 5: opening LMDB...")
     store = Store(lmdb_dir, map_size_gb=lmdb_map_gb)
-    # Your current Processor signature is Processor(hosters, store)
-    proc = Processor(hosters, store)
+    # Your Processor signature requires a feed_policy third arg
+    proc = Processor(hosters, store, feed_policy)
 
+    # Ingest feeds (if any)
     logger.info("Step 5: ingesting feeds...")
     n = 0
     txn = store.env.begin(write=True)
     for feed_name, path in feed_specs:
-        parser_cls_or_fn = FEED_REGISTRY[feed_name]
-        # Allow either a class with .iter_records(file) or a callable factory returning that.
-        parser = parser_cls_or_fn() if hasattr(parser_cls_or_fn, "__call__") and hasattr(getattr(parser_cls_or_fn, "__call__"), "__call__") else parser_cls_or_fn
+        parser_entry = FEED_REGISTRY[feed_name]
+        # Resolve an instance with .iter_records(file_path)
+        if hasattr(parser_entry, "iter_records"):
+            parser = parser_entry  # already an instance-like object
+        elif callable(parser_entry):
+            parser = parser_entry()  # construct instance
+        else:
+            raise TypeError(f"FEED_REGISTRY['{feed_name}'] must be a class/instance with iter_records()")
 
         files = _expand_files(path)
         logger.info(f"[{feed_name}] Found {len(files)} files matching {path}")
@@ -155,6 +178,7 @@ def ingest_and_export(config_path: str) -> None:
             logger.info(f"[{feed_name}] Processing {f}")
             try:
                 for rec in parser.iter_records(f):
+                    # rec should be a dict like: {"ip": "1.2.3.4", "source": feed_name, "domain": optional}
                     proc.ingest_record(rec, txn)
                     n += 1
                     if n % commit_every == 0:
@@ -167,24 +191,25 @@ def ingest_and_export(config_path: str) -> None:
     logger.info("Step 5: finalizing shared IPs...")
     proc.finalize_shared()
 
-    # ---------------------------
-    # Build final CSV
-    # ---------------------------
+    # -------------------------------------------------------------------
+    # Build final CSV (feeds + seen/shared + capacity carry-forward)
+    # -------------------------------------------------------------------
     logger.info("Step 5: generating output CSV...")
-    # Header: feed columns + store summary + capacity carry-forward
+    # Header: feed columns + store summary + capacity columns
     header = ["hoster"]
     for feed in feeds_to_report:
+        # if COUNT_DOMAINS True, your Processor might track both domains and ips;
+        # but to keep stable, we always at least output *_ips
         header.append(f"{feed}_ips")
     header += ["domaincount_seen", "ipcount_seen", "ipcount_shared", "domaincount_shared"]
-    # capacity columns we want to carry forward (if present)
     cap_cols = ["domaincount", "cidr_count", "total_ips", "avg_domains_per_ip", "cidrs"]
     header += cap_cols
 
-    # Gather per-feed IP counts
+    # Per-feed IP counts (grouped by (hoster, source))
     try:
         perfeed_ips = store.count_dups_grouped_hoster_source(store.db_hoster_src_ips)
     except Exception:
-        perfeed_ips = {}  # if store doesn't support this, fall back to empty
+        perfeed_ips = {}
 
     # Overall counts
     try:
@@ -199,11 +224,10 @@ def ingest_and_export(config_path: str) -> None:
         domaincount_shared = store.count_dups(store.db_hoster_domains_sh)
     except Exception:
         domaincount_shared = {}
-    # ipcount_shared is computed inside Processor.finalize_shared()
+
     ipcount_shared_map = getattr(proc, "ipcount_shared", {})
 
-    # We want to include every hoster from capacity_map even if no feeds were present,
-    # plus any hoster discovered by Store/Processor.
+    # Names to output: union of capacity orgs and hoster list
     names_from_capacity = list(capacity_map.keys())
     names_from_hosters = all_hoster_names
     all_names = sorted(set(names_from_capacity) | set(names_from_hosters))
@@ -226,7 +250,7 @@ def ingest_and_export(config_path: str) -> None:
             dsh = domaincount_shared.get(hoster, 0)
             row.extend([str(dcs), str(ips), str(ipsh), str(dsh)])
 
-            # capacity carry-forward (if available)
+            # capacity carry-forward
             cap = capacity_map.get(hoster, {})
             for c in cap_cols:
                 row.append(str(cap.get(c, "")))
