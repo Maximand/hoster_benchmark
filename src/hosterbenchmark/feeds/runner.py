@@ -30,7 +30,7 @@ except ImportError:
 from hosterbenchmark.feeds.parsers import (
     FEED_REGISTRY,
     load_hosters,      # returns dict[str, list[str]]  hoster -> [cidrs...]
-    expand_files,      # glob/dir expansion helper
+    _expand_files,      # glob/dir expansion helper
 )
 from hosterbenchmark.feeds.store import Store, Processor
 
@@ -149,7 +149,7 @@ def ingest_and_export(config_path: str) -> None:
         # Allow either a class with .iter_records(file) or a callable factory returning that.
         parser = parser_cls_or_fn() if hasattr(parser_cls_or_fn, "__call__") and hasattr(getattr(parser_cls_or_fn, "__call__"), "__call__") else parser_cls_or_fn
 
-        files = expand_files(path)
+        files = _expand_files(path)
         logger.info(f"[{feed_name}] Found {len(files)} files matching {path}")
         for f in files:
             logger.info(f"[{feed_name}] Processing {f}")
