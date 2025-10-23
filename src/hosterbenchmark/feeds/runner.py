@@ -16,7 +16,7 @@ import csv
 import argparse
 import logging
 
-from hosterbenchmark.feeds.parsers import FEED_REGISTRY, load_hosters, expand_files
+from hosterbenchmark.feeds.parsers import FEED_REGISTRY, load_hosters, _expand_files
 from hosterbenchmark.feeds.store import Store, Processor
 
 try:
