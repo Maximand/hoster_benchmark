@@ -1,0 +1,7 @@
+pytricia
+publicsuffix2
+tld
+pandas
+lmdb
+pyyaml
+typer[all]

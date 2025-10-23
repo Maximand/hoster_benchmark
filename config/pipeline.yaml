@@ -1,0 +1,21 @@
+paths:
+  dnsdb_glob: "data/dnsdb_dummy/*.json.gz"
+  step1_out_dir: "data/work/step1"
+  step2_out_dir: "data/work/step2"
+  tmpdir_step3: "data/work/tmp3"
+  lmdb_dir: "data/work/lmdb"
+  cidr_map: "config/hosters.txt"
+
+feeds_file: "config/feeds.yaml"
+hosters_file: "config/hosters.txt"
+
+outputs:
+  orgs_over_threshold: "data/output/orgs.csv"
+  capacity_csv: "data/output/capacity.csv"
+  hoster_counts_csv: "data/output/feeds.csv"
+  merged_csv: "data/output/merged.csv"
+
+params:
+  threshold_sld_count: 1
+  commit_every: 5
+  lmdb_map_gb: 1

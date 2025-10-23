@@ -1,0 +1,28 @@
+[project]
+name = "hosterbenchmark"
+version = "0.1.0"
+description = "Benchmarking pipeline for hoster abuse/capacity metrics"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+authors = [{name="Max van der Horst"}]
+dependencies = [
+  "pytricia",
+  "publicsuffix2",
+  "tld",
+  "pandas",
+  "lmdb",
+  "pyyaml",
+  "typer[all]",       # CLI
+]
+
+[project.scripts]
+hb = "hosterbench.cli:app"        # main CLI entrypoint
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-q"
+

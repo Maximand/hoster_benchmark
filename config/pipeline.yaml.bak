@@ -1,0 +1,14 @@
+paths:
+  input_dir: data/feeds
+  output_dir: data
+  lmdb_dir: data/lmdb
+
+feeds_file: config/feeds.yaml
+hosters_file: config/hosters.txt
+
+outputs:
+  hoster_counts_csv: data/hoster_abuse_counts.csv
+
+params:
+  commit_every: 10
+  lmdb_map_gb: 1

@@ -1,0 +1,3 @@
+feeds:
+  - name: dummy_feed
+    path: data/feeds/dummy_feed.csv
