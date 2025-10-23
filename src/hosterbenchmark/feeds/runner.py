@@ -44,7 +44,7 @@ def ingest_and_export(config_path: str):
     cfg = _load_yaml_config(config_path)
 
     feeds_conf = cfg.get("feeds_file")
-    hosters_file = cfg.get("hosters_file")
+    hosters, hoster_meta = load_hosters(cfg["paths"]["cidr_map"], return_meta=True)
     lmdb_dir = cfg["paths"]["lmdb_dir"]
     output_csv = cfg["outputs"]["hoster_counts_csv"]
 

@@ -1,152 +1,178 @@
-"""
-Feed parser registry and helpers for HosterBenchmark (Step 5).
-
-This module provides:
-- FEED_REGISTRY: mapping of feed names → parser functions
-- @register_feed decorator for adding new parsers
-- load_hosters(): load hoster → prefix mappings from text/CSV/YAML
-- _expand_files(): glob path expansion utility
-"""
-
+import ast
 import csv
-import glob
+import json
 import os
 import re
-from typing import List, Dict, Callable
+from collections import defaultdict
+from typing import Dict, List, Tuple, Optional, Union
 
-# --- Feed registry and decorator ---------------------------------------------
+CIDR_V4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}/\d{1,2}\b")
 
-FEED_REGISTRY: Dict[str, Callable] = {}
-
-def register_feed(name: str):
+def _parse_range_list_value(raw: str) -> List[str]:
     """
-    Decorator to register a feed parser.
-    Usage:
-
-        @register_feed("apwg_csv_ip")
-        def parse_apwg_csv_ip(line: str) -> list[str]:
-            ...
-            return [ip1, ip2]
+    Parse a list of CIDRs from flexible cell content.
+    Accepts:
+      - JSON array: '["1.2.3.0/24","4.5.6.0/22"]'
+      - Python list: "['1.2.3.0/24', '4.5.6.0/22']"
+      - Delimited string: "1.2.3.0/24, 4.5.6.0/22" or "1.2.3.0/24 | 4.5.6.0/22"
+      - Fallback regex for IPv4 CIDRs
     """
-    def decorator(func: Callable):
-        FEED_REGISTRY[name] = func
-        return func
-    return decorator
+    if raw is None:
+        return []
+    s = str(raw).strip()
+    if not s:
+        return []
 
-# --- Utility: expand glob paths ----------------------------------------------
+    # JSON list
+    try:
+        v = json.loads(s)
+        if isinstance(v, (list, tuple)):
+            return [str(x).strip() for x in v if x]
+    except Exception:
+        pass
 
-def _expand_files(pathlike: str) -> List[str]:
+    # Python literal list/tuple
+    try:
+        v = ast.literal_eval(s)
+        if isinstance(v, (list, tuple)):
+            return [str(x).strip() for x in v if x]
+    except Exception:
+        pass
+
+    # Delimited strings
+    if "|" in s:
+        parts = [p.strip().strip("'").strip('"') for p in s.split("|")]
+        cand = [p for p in parts if p]
+        if cand:
+            return cand
+    if "," in s:
+        parts = [p.strip().strip("'").strip('"') for p in s.split(",")]
+        cand = [p for p in parts if p]
+        if cand:
+            return cand
+
+    # Regex fallback (IPv4 only)
+    return CIDR_V4_RE.findall(s)
+
+
+def load_hosters(
+    path: str,
+    *,
+    return_meta: bool = False
+) -> Union[Dict[str, List[str]], Tuple[Dict[str, List[str]], Dict[str, dict]]]:
     """
-    Expand directory or glob pattern into sorted list of files.
+    Load a MaxMind-derived hosters file in *pipe* format.
+
+    Expected flexible schema (header optional):
+        Organization | Ranges | Size | Country_hist
+        Zeimudo Networks Ltd.|['1.3.3.0/24', '103.1.72.0/22']|1280|{'CN': 256, 'UA': 1024}
+
+    - Only 'Organization' and 'Ranges' are required.
+    - 'Ranges' may be JSON list, Python list, or a delimited string.
+    - Extra columns are ignored unless return_meta=True.
+
+    Returns:
+        prefixes_by_org: dict { org: [cidrs...] }
+        meta_by_org (optional): dict { org: { "Size": <int?>, "Country_hist": <dict|str> , ... } }
     """
-    if os.path.isdir(pathlike):
-        return [
-            os.path.join(pathlike, f)
-            for f in sorted(os.listdir(pathlike))
-            if os.path.isfile(os.path.join(pathlike, f))
-        ]
-    matches = sorted(glob.glob(pathlike, recursive=True))
-    return [m for m in matches if os.path.isfile(m)]
+    if not path or not os.path.exists(path):
+        raise FileNotFoundError(f"Hosters file not found: {path}")
 
-# --- Utility: load hosters ---------------------------------------------------
+    prefixes_by_org: Dict[str, List[str]] = defaultdict(list)
+    meta_by_org: Dict[str, dict] = {}
 
-def load_hosters(path: str, delimiter: str = "|", comment_prefix: str = "#") -> Dict[str, List[str]]:
-    """
-    Load hosters from a simple pipe-delimited or CSV file.
-
-    Returns a dict:
-        { "TransIP": ["prefix1", "prefix2"], "OVH": ["prefix3", ...] }
-
-    Compatible formats:
-        name|prefix1,prefix2
-        name|["prefix1","prefix2"]
-        # comments are ignored
-    """
-    hosters: Dict[str, List[str]] = {}
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        reader = csv.reader(f, delimiter=delimiter)
-        for row in reader:
-            if not row or row[0].startswith(comment_prefix):
+    # Read as plain text, split by pipe. Header optional.
+    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+        first = True
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
                 continue
-            name = row[0].strip()
-            if not name:
-                continue
-            prefixes: List[str] = []
-            if len(row) > 1 and row[1].strip():
-                raw = row[1].strip()
-                # parse list-like strings
-                if raw.startswith("[") and raw.endswith("]"):
-                    raw = raw.strip("[]")
-                    prefixes = [p.strip().strip("'\"") for p in raw.split(",") if p.strip()]
-                elif "," in raw:
-                    prefixes = [p.strip() for p in raw.split(",") if p.strip()]
+
+            parts = [p.strip() for p in line.split("|")]
+            # Heuristic: check header in the first non-empty line
+            if first:
+                first = False
+                # header if it contains "organization" and "ranges" in some order
+                low = [p.lower() for p in parts]
+                if "organization" in low and "ranges" in low:
+                    header = [p.lower() for p in parts]
+                    org_idx = header.index("organization")
+                    rng_idx = header.index("ranges")
+                    # keep header info for named extraction
+                    name_cols = { "org": org_idx, "ranges": rng_idx }
+                    continue
                 else:
-                    prefixes = [raw]
-            hosters[name] = prefixes
-    return hosters
+                    # no header
+                    name_cols = None
 
-# --- Example built-in parsers ------------------------------------------------
+            if name_cols:
+                try:
+                    org = parts[name_cols["org"]]
+                    ranges_raw = parts[name_cols["ranges"]]
+                except Exception:
+                    # malformed row vs header; skip
+                    continue
+                extra = {}
+                # record any extra columns as metadata (best-effort)
+                if len(parts) > 2:
+                    # rebuild mapping by header indices if available
+                    # otherwise index-based keys
+                    # Here we only try common names
+                    try:
+                        # try to parse Size (int-like)
+                        if "size" in header:
+                            size_idx = header.index("size")
+                            size_val = parts[size_idx]
+                            try:
+                                extra["Size"] = int(size_val.replace(",", "").strip())
+                            except Exception:
+                                extra["Size"] = size_val
+                        # try to parse Country_hist (dict-like)
+                        if "country_hist" in header:
+                            ch_idx = header.index("country_hist")
+                            ch_val = parts[ch_idx]
+                            try:
+                                extra["Country_hist"] = ast.literal_eval(ch_val)
+                            except Exception:
+                                extra["Country_hist"] = ch_val
+                    except Exception:
+                        pass
+            else:
+                # no header: assume Organization | Ranges | ...
+                if len(parts) < 2:
+                    continue
+                org, ranges_raw = parts[0], parts[1]
+                # capture extras as metadata (positional best-effort)
+                extra = {}
+                if len(parts) >= 3:
+                    # Size (optional)
+                    try:
+                        extra["Size"] = int(parts[2].replace(",", "").strip())
+                    except Exception:
+                        extra["Size"] = parts[2]
+                if len(parts) >= 4:
+                    # Country_hist (optional, python-literal dict)
+                    try:
+                        extra["Country_hist"] = ast.literal_eval(parts[3])
+                    except Exception:
+                        extra["Country_hist"] = parts[3]
 
-@register_feed("apwg_csv_ip")
-def parse_apwg_csv_ip(line: str) -> List[str]:
-    """
-    Parse APWG CSV (no header, IPs in 4th column).
-    Returns list of IPv4 strings.
-    """
-    parts = line.strip().split(",")
-    if len(parts) < 4:
-        return []
-    # Example column 3: "[u'1.2.3.4', u'5.6.7.8']"
-    ip_field = parts[3]
-    ips = re.findall(r"(?:\d{1,3}\.){3}\d{1,3}", ip_field)
-    return ips
+            # Parse ranges to CIDR list
+            cidrs = _parse_range_list_value(ranges_raw)
+            if not cidrs:
+                continue
+            prefixes_by_org[org].extend(cidrs)
 
-# Disable domain counting for this parser (IP-only)
-parse_apwg_csv_ip.COUNT_DOMAINS = False
+            if return_meta:
+                # merge metadata (if multiple rows per org)
+                if org not in meta_by_org:
+                    meta_by_org[org] = {}
+                meta_by_org[org].update({k: v for k, v in extra.items() if v is not None})
 
-@register_feed("dshield_daily")
-def parse_dshield_daily(line: str) -> List[str]:
-    """
-    Parse DShield daily_sources TSV (source IP in first column).
-    """
-    if not line or line.startswith("#") or line.lower().startswith("source ip"):
-        return []
-    parts = line.strip().split("\t")
-    if not parts:
-        return []
-    ip = parts[0].strip()
-    return [ip] if re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", ip) else []
+    # Deduplicate & sort CIDRs
+    prefixes_by_org = { org: sorted(set(v)) for org, v in prefixes_by_org.items() }
 
-parse_dshield_daily.COUNT_DOMAINS = False
-
-
-@register_feed("dummy_feed")
-def parse_dummy_feed(line: str) -> list[str]:
-    """
-    CSV with header:
-      timestamp,source_ip,feed_info
-    Returns: [source_ip] if it looks like IPv4, else [].
-    """
-    s = line.strip()
-    if not s or s.lower().startswith("timestamp"):
-        return []
-    parts = s.split(",")
-    if len(parts) < 2:
-        return []
-    ip = parts[1].strip()
-    # simple IPv4 check
-    if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", ip):
-        return [ip]
-    return []
-
-# IP-only; don't count domains for this feed
-parse_dummy_feed.COUNT_DOMAINS = False
-
-# -----------------------------------------------------------------------------
-# @register_feed("my_feed_name")
-# def parse_my_feed(line: str) -> list[str]:
-#     ...
-#     return [ip1, ip2]
-#
-# parse_my_feed.COUNT_DOMAINS = False
-# -----------------------------------------------------------------------------
+    if return_meta:
+        return prefixes_by_org, meta_by_org
+    return prefixes_by_org
