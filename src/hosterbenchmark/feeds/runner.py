@@ -6,13 +6,13 @@ Inputs:
   - pipeline.yaml (this function reads it)
   - feeds.yaml    (referenced by pipeline.yaml as feeds_file)
   - hosters file  (CSV/pipe/MaxMind-like; referenced by pipeline.yaml as hosters_file)
+
 Outputs:
   - outputs.hoster_counts_csv (pipe CSV)
 """
 
 import os
 import csv
-import glob
 import argparse
 import logging
 
@@ -38,43 +38,59 @@ def _load_yaml_config(cfg_path: str) -> dict:
         return yaml.safe_load(fh) or {}
 
 
+def _unpack_load_hosters(result):
+    """
+    load_hosters() may return:
+      - dict: {org: [cidr,...]}
+      - (dict, meta): (prefix_map, metadata)
+    Normalize to (prefix_map, meta_dict).
+    """
+    if isinstance(result, tuple) and len(result) == 2:
+        return result[0] or {}, result[1] or {}
+    return result or {}, {}  # dict only
+
+
 def ingest_and_export(config_path: str):
     cfg = _load_yaml_config(config_path)
 
-    # --- pull paths/outputs/params from pipeline.yaml ---
     paths   = cfg.get("paths", {}) or {}
     outputs = cfg.get("outputs", {}) or {}
     params  = cfg.get("params", {}) or {}
 
-    feeds_conf   = cfg.get("feeds_file")                 # e.g. config/feeds.yaml
-    hosters_file = cfg.get("hosters_file")               # <-- IMPORTANT: define this
-    lmdb_dir     = paths.get("lmdb_dir", "data/work/lmdb")
-    output_csv   = outputs.get("hoster_counts_csv", "data/output/hoster_abuse_counts.csv")
+    # *** IMPORTANT: define both from YAML ***
+    feeds_conf   = cfg.get("feeds_file")                      # e.g. config/feeds.yaml
+    hosters_file = cfg.get("hosters_file") or paths.get("cidr_map")
+
+    lmdb_dir   = paths.get("lmdb_dir", "data/work/lmdb")
+    output_csv = outputs.get("hoster_counts_csv", "data/output/hoster_abuse_counts.csv")
 
     commit_every = int(params.get("commit_every", 10000))
     lmdb_map_gb  = int(params.get("lmdb_map_gb", 64))
 
     if not hosters_file:
-        raise ValueError("pipeline.yaml is missing 'hosters_file'")
+        raise ValueError("pipeline.yaml is missing 'hosters_file' (or paths.cidr_map).")
     if not feeds_conf:
-        raise ValueError("pipeline.yaml is missing 'feeds_file' (path to feeds.yaml)")
+        raise ValueError("pipeline.yaml is missing 'feeds_file' (path to feeds.yaml).")
 
+    # Hosters
     logger.info("Step 5: loading hosters...")
-    # load_hosters returns (prefix_map, metadata) where prefix_map is {org: [cidr,...]}
-    prefix_map, hoster_meta = load_hosters(hosters_file)
-    hosters = prefix_map
+    prefix_map_raw = load_hosters(hosters_file)
+    hosters, hoster_meta = _unpack_load_hosters(prefix_map_raw)
+    if not hosters:
+        raise ValueError(f"No hosters parsed from {hosters_file}")
     all_hoster_names = sorted(hosters.keys())
 
+    # Feeds
     logger.info("Step 5: loading feeds...")
     with open(feeds_conf, "r", encoding="utf-8") as fh:
         feeds_yaml = yaml.safe_load(fh) or {}
     feeds_list = feeds_yaml.get("feeds", [])
+    if not feeds_list:
+        logger.warning(f"No feeds defined in {feeds_conf}")
 
-    # Build parser objects per feed
     parser_objs = {}
-    feed_specs = []
     feeds_to_report = []
-
+    feed_specs = []
     for item in feeds_list:
         name = item.get("name")
         path = item.get("path")
@@ -83,15 +99,15 @@ def ingest_and_export(config_path: str):
         if name not in FEED_REGISTRY:
             raise ValueError(f"Unknown feed: {name}. Add a parser in feeds/parsers.py")
         if name not in parser_objs:
-            parser_objs[name] = FEED_REGISTRY[name]()  # instantiate the parser
+            parser_objs[name] = FEED_REGISTRY[name]()  # instantiate
         feeds_to_report.append(name)
         feed_specs.append((name, path))
 
-    # Determine which feeds count domains (most of yours are IP-only → False)
+    # Per-feed domain policy
     feed_domain_policy = {name: bool(getattr(parser_objs[name], "COUNT_DOMAINS", True))
                           for name in parser_objs}
 
-    # Open LMDB + Processor
+    # LMDB + Processor
     logger.info("Step 5: opening LMDB...")
     os.makedirs(lmdb_dir, exist_ok=True)
     store = Store(lmdb_dir, map_size_gb=lmdb_map_gb)
@@ -101,7 +117,6 @@ def ingest_and_export(config_path: str):
     logger.info("Step 5: ingesting feeds...")
     txn = store.env.begin(write=True)
     n = 0
-
     for name, path in feed_specs:
         parser = parser_objs[name]
         files = expand_files(path)
@@ -117,14 +132,13 @@ def ingest_and_export(config_path: str):
                         txn = store.env.begin(write=True)
             except Exception as e:
                 logger.warning(f"Error in {f}: {e}")
-
     txn.commit()
 
-    # Derive shared IPs (relevant only if any feed counted domains)
+    # Finalize shared IPs (only relevant if any feed counted domains)
     logger.info("Step 5: finalizing shared IPs...")
     proc.finalize_shared()
 
-    # Prepare header
+    # Output CSV
     logger.info("Step 5: generating output CSV...")
     header = ["hoster"]
     for feed in feeds_to_report:
