@@ -119,7 +119,7 @@ def ingest_and_export(config_path: str):
     n = 0
     for name, path in feed_specs:
         parser = parser_objs[name]
-        files = expand_files(path)
+        files = _expand_files(path)
         logger.info(f"[{name}] Found {len(files)} files matching {path}")
         for f in files:
             logger.info(f"[{name}] Processing {f}")
