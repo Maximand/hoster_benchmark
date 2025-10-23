@@ -133,7 +133,7 @@ def enrich_pairs(config_path: Optional[str] = None) -> None:
     params = cfg.get("params", {})
 
     input_glob = paths.get("step1_out_dir", "") + "/2lds_*.gz"
-    out_dir = paths.get("step1_out_dir", "")  # write back to same dir (for now)
+    out_dir = paths.get("step2_out_dir", "")  # write back to same dir (for now)
     hosters_path = cfg.get("hosters_file")
     processes = int(params.get("processes", 1))
 

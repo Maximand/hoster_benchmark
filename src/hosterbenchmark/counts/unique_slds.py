@@ -1,69 +1,84 @@
 #!/usr/bin/env python3
 """
-Step 3 — Count unique registrable domains (SLDs) per org
-Input:  step3_enriched_*.txt  lines like: domain | ip | org
-Output: org|domaincount CSV (thresholded)
+Step 3 — Count SLD occurrences per org (NO DEDUPLICATION).
 
-Large sets are spilled to disk and deduplicated using external sort.
+Input (glob):   data/work/step2/step3_enriched_*
+Each line:      "<domain> | <ip> | <org>"
 
-Example:
-  python -m hosterbench.counts.unique_slds --config config/pipeline.yaml
+Output (pipe CSV): outputs.orgs_over_threshold
+Columns:        Organization|domaincount|cidrs
+
+Notes:
+- Every line contributes +1 to its organization's count once converted to an SLD.
+- There is absolutely NO deduplication. Repeated domain/org pairs or repeated SLDs
+  are all counted again.
+- CIDRs are loaded from paths.cidr_map and can be MaxMind-style:
+    Organization|Ranges|[Size]|[Country_hist]
 """
 
-import os
-import csv
-import re
-import sys
-import yaml
-import json
-import glob
-import tempfile
-import subprocess
-import logging
-from collections import defaultdict
+from __future__ import annotations
 
-from publicsuffix2 import get_sld
+import argparse
+import csv
+import glob
+import json
+import logging
+import os
+import re
+from collections import defaultdict
+from typing import Dict, List
+
+try:
+    from publicsuffix2 import get_sld
+except Exception:
+    get_sld = None
+
+# ---------- logging ----------
+logger = logging.getLogger("step3.sld_counts_nodedup")
+logger.setLevel(logging.INFO)
+_handler = logging.StreamHandler()
+_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+logger.addHandler(_handler)
 
 csv.field_size_limit(10**7)
-logger = logging.getLogger("step3.unique_slds")
-if not logger.handlers:
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-    logger.addHandler(h)
-logger.setLevel(logging.INFO)
 
-# ---------------------------
-# Helpers
-# ---------------------------
+# ---------- helpers ----------
 
-def to_sld(domain: str):
-    try:
-        return get_sld(domain.strip().lower().rstrip("."))
-    except Exception:
+def to_sld(domain: str) -> str | None:
+    if not domain:
         return None
+    d = domain.strip().lower().rstrip(".")
+    if not d:
+        return None
+    if get_sld:
+        try:
+            return get_sld(d)
+        except Exception:
+            return None
+    # fallback: last two labels
+    parts = d.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else d
 
-def _is_probably_json_list(s: str) -> bool:
-    s = (s or "").strip()
-    return (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")"))
 
-def _parse_cidr_list(raw: str):
-    """
-    Parse a list of CIDRs from flexible cell content.
-    Accepts JSON/Python list strings or comma/pipe separated.
-    """
+CIDR_V4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}/\d{1,2}\b")
+
+def _parse_range_list_value(raw: str) -> List[str]:
+    """Flexible parser for a cell containing CIDR ranges."""
     if raw is None:
         return []
     s = str(raw).strip()
     if not s:
         return []
-    # try JSON first
+
+    # Try JSON array
     try:
         v = json.loads(s)
         if isinstance(v, (list, tuple)):
             return [str(x).strip() for x in v if x]
     except Exception:
         pass
-    # try python literal
+
+    # Try Python literal
     try:
         import ast
         v = ast.literal_eval(s)
@@ -71,161 +86,110 @@ def _parse_cidr_list(raw: str):
             return [str(x).strip() for x in v if x]
     except Exception:
         pass
-    # delimiter fallback
-    if "|" in s and not _is_probably_json_list(s):
-        parts = [p.strip().strip("'").strip('"') for p in s.split("|")]
-        return [p for p in parts if p]
-    if "," in s and not _is_probably_json_list(s):
-        parts = [p.strip().strip("'").strip('"') for p in s.split(",")]
-        return [p for p in parts if p]
-    # regex last resort (IPv4 only)
-    cidr_re = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}/\d{1,2}\b")
-    return cidr_re.findall(s)
 
-def load_hoster_cidrs(path: str) -> dict:
+    # Delimited strings
+    if "|" in s:
+        parts = [p.strip().strip("'").strip('"') for p in s.split("|")]
+        cand = [p for p in parts if p]
+        if cand:
+            return cand
+    if "," in s:
+        parts = [p.strip().strip("'").strip('"') for p in s.split(",")]
+        cand = [p for p in parts if p]
+        if cand:
+            return cand
+
+    # Regex fallback (IPv4 only)
+    return CIDR_V4_RE.findall(s)
+
+
+def load_hoster_cidrs(path: str) -> Dict[str, List[str]]:
     """
-    Return dict: {Organization: [cidrs...]}
-    Supports:
-      - pipe text:   name | ... | ["1.2.3.0/24", ...]
-      - CSV (, or |): columns Organization + cidrs/ranges/prefixes
-      - YAML:
-          hosters:
-            - name: Example
-              prefixes: [...]
+    Load hoster->CIDRs map from CSV/pipe file.
+
+    Supports MaxMind-like:
+      Organization | Ranges | [Size] | [Country_hist]
+
+    Also supports legacy: hoster/name + cidrs/prefixes/prefix.
     """
     if not path or not os.path.exists(path):
-        raise FileNotFoundError(f"CIDR map file not found: {path}")
+        raise FileNotFoundError(f"CIDR map not found: {path}")
 
-    lower = path.lower()
-
-    # YAML
-    if lower.endswith((".yml", ".yaml")):
-        with open(path, "r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh) or {}
-        out = {}
-        for item in (data.get("hosters") or []):
-            name = str(item.get("name", "")).strip()
-            prefs = [p.strip() for p in (item.get("prefixes") or []) if p]
-            if name and prefs:
-                out[name] = sorted(set(prefs))
-        return out
-
-    # Peek first non-empty line
-    def first_line(p):
-        with open(p, "r", encoding="utf-8", errors="ignore") as fh:
-            for line in fh:
-                t = line.strip()
-                if t:
-                    return t
-        return ""
-
-    head = first_line(path)
-
-    # CSV with header (comma or pipe)
-    if ("," in head) or ("|" in head and head.count("|") >= 1 and head.lower().replace(" ", "").startswith("organization")):
-        with open(path, "r", encoding="utf-8", errors="ignore", newline="") as fh:
-            # Sniff delimiter cheaply
-            delim = "," if "," in head and "|" not in head else "|"
-            rdr = csv.DictReader(fh, delimiter=delim)
-            # normalize keys
-            rows = []
-            for row in rdr:
-                if not row:
-                    continue
-                rows.append({(k or "").strip(): (v or "").strip() for k, v in row.items()})
-            # pick columns
-            name_col = None
-            for c in ("Organization", "org", "hoster", "name"):
-                if rows and c in rows[0]:
-                    name_col = c
-                    break
-            cidr_col = None
-            for c in ("cidrs", "ranges", "prefixes", "prefix"):
-                if rows and c in rows[0]:
-                    cidr_col = c
-                    break
-            if not name_col or not cidr_col:
-                # fall back to heuristic on any row
-                if rows:
-                    keys = list(rows[0].keys())
-                else:
-                    keys = []
-                raise ValueError(f"CSV CIDR map missing expected columns; got: {keys}")
-            out = defaultdict(list)
-            for r in rows:
-                name = r.get(name_col, "")
-                raw = r.get(cidr_col, "")
-                cidrs = _parse_cidr_list(raw)
-                if name and cidrs:
-                    out[name].extend(cidrs)
-            return {k: sorted(set(v)) for k, v in out.items()}
-
-    # Pipe text (3rd column contains list)
-    out = defaultdict(list)
+    # Detect delimiter by header line
     with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-        for raw in fh:
-            line = raw.strip()
-            if not line or line.startswith("#"):
+        head = ""
+        for line in fh:
+            if line.strip():
+                head = line.strip()
+                break
+    delim = "|" if head.count("|") >= head.count(",") else ","
+
+    out = defaultdict(list)
+    with open(path, "r", encoding="utf-8", errors="ignore", newline="") as fh:
+        rdr = csv.DictReader(fh, delimiter=delim)
+        headers = [h.strip() for h in (rdr.fieldnames or [])]
+        lowmap = {h.lower(): h for h in headers}
+
+        # Column selection (case-insensitive)
+        name_col = (
+            lowmap.get("organization")
+            or lowmap.get("org")
+            or lowmap.get("hoster")
+            or lowmap.get("name")
+        )
+        cidr_col = (
+            lowmap.get("ranges")
+            or lowmap.get("cidrs")
+            or lowmap.get("prefixes")
+            or lowmap.get("prefix")
+        )
+
+        if not name_col or not cidr_col:
+            raise ValueError(
+                f"CSV CIDR map missing expected columns; got: {headers}"
+            )
+
+        for row in rdr:
+            if not row:
                 continue
-            parts = [p.strip() for p in line.split("|")]
-            if len(parts) < 3:
+            org = (row.get(name_col) or "").strip()
+            raw_ranges = row.get(cidr_col)
+            if not org or raw_ranges is None:
                 continue
-            name, ranges_raw = parts[0], parts[2]
-            cidrs = _parse_cidr_list(ranges_raw)
-            if name and cidrs:
-                out[name].extend(cidrs)
+            cidrs = _parse_range_list_value(raw_ranges)
+            if cidrs:
+                out[org].extend(cidrs)
+
     return {k: sorted(set(v)) for k, v in out.items()}
 
-# ---------------------------
-# Core Step 3
-# ---------------------------
 
-def count_unique_slds(config_path: str):
+# ---------- core step (NO DEDUP) ----------
+
+def count_sld_occurrences_from_args(
+    inputs_glob: str,
+    out_csv: str,
+    threshold: int,
+    cidr_map_path: str | None,
+) -> None:
     """
-    Reads step2 enriched files, counts unique SLDs per org, joins CIDRs, writes:
-      Organization|domaincount|cidrs
+    Scan enriched files and count SLD occurrences per org.
+    No deduplication at all: every line increments its org by +1 if an SLD is derived.
     """
-    import yaml as _yaml
-    with open(config_path, "r", encoding="utf-8") as fh:
-        cfg = _yaml.safe_load(fh) or {}
-
-    paths = cfg.get("paths", {})
-    inputs_glob = os.path.join(paths.get("step2_out_dir", ""), "step3_enriched_*")
-    tmpdir = paths.get("tmpdir_step3", "data/work/tmp_step3")
-    os.makedirs(tmpdir, exist_ok=True)
-
-    outputs = cfg.get("outputs", {})
-    out_csv = outputs.get("orgs_over_threshold")
-    if not out_csv:
-        raise ValueError("Missing outputs.orgs_over_threshold in pipeline config")
-    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-
-    threshold = int(cfg.get("params", {}).get("threshold_sld_count", 100))
     files = sorted(glob.glob(inputs_glob))
     if not files:
-        logger.info("Step3: no input files found (glob: %s)", inputs_glob)
+        logger.info(f"Step3: no input files found (glob: {inputs_glob})")
 
-    logger.info("Step3: Counting SLDs from %d files with 1 process(es)", len(files))
+    logger.info(f"Step3: Counting SLD occurrences from {len(files)} files (no dedup)")
 
-    # org -> set(SLD)
-    org_slds = defaultdict(set)
-    tmpfiles = []
+    counts: Dict[str, int] = defaultdict(int)
 
-    def flush():
-        if not org_slds:
-            return
-        tmp = tempfile.NamedTemporaryFile(delete=False, dir=tmpdir, prefix="flush_", suffix=".txt")
-        with open(tmp.name, "w", encoding="utf-8") as out:
-            for org, slds in org_slds.items():
-                for s in slds:
-                    out.write(f"{org}|{s}\n")
-        tmpfiles.append(tmp.name)
-        org_slds.clear()
-
-    # read enriched lines: "domain | ip | org"
     for path in files:
-        logger.info("[{}] processing".format(os.path.basename(path)))
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        logger.info(f"[{os.path.basename(path)}] processing")
+        opener = open
+        if path.endswith(".gz"):
+            import gzip
+            opener = lambda p, *a, **k: gzip.open(p, "rt", encoding="utf-8", errors="replace")
+        with opener(path, "rt", encoding="utf-8", errors="replace") as f:
             for line in f:
                 if "|" not in line:
                     continue
@@ -235,58 +199,82 @@ def count_unique_slds(config_path: str):
                 domain, _ip, org = parts[0], parts[1], parts[2]
                 sld = to_sld(domain)
                 if org and sld:
-                    org_slds[org].add(sld)
-        flush()
+                    counts[org] += 1  # <-- NO DEDUP: count every occurrence
 
-    logger.info("Step3: Flushed to %d temp files", len(tmpfiles))
+    _write_output(counts, out_csv, cidr_map_path, threshold)
+    logger.info(f"Step3: Wrote {out_csv}")
 
-    # Merge + dedup globally
-    merged = os.path.join(tmpdir, "all_pairs.txt")
-    sorted_unique = os.path.join(tmpdir, "all_pairs_unique.txt")
 
-    logger.info("Merging temp files...")
-    with open(merged, "w", encoding="utf-8") as out:
-        for tf in tmpfiles:
-            with open(tf, "r", encoding="utf-8") as f:
-                for line in f:
-                    out.write(line)
-            os.remove(tf)
+def _write_output(
+    counts: Dict[str, int],
+    out_csv: str,
+    cidr_map_path: str | None,
+    threshold: int,
+) -> None:
+    """
+    Write pipe-delimited CSV: Organization|domaincount|cidrs
+    """
+    os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
 
-    logger.info("Deduplicating via external sort...")
-    subprocess.run(["sort", "-u", "-T", tmpdir, "-S", "1G", merged, "-o", sorted_unique], check=True)
-    os.remove(merged)
+    # Load CIDRs (optional but recommended; Step 4 expects 'cidrs' column)
+    cidrs_by_org: Dict[str, List[str]] = {}
+    if cidr_map_path and os.path.exists(cidr_map_path):
+        try:
+            cidrs_by_org = load_hoster_cidrs(cidr_map_path)
+        except Exception as e:
+            logger.warning(f"Could not load CIDR map from {cidr_map_path}: {e}")
 
-    # Count per org
-    logger.info("Counting per org...")
-    counts = defaultdict(int)
-    if os.path.exists(sorted_unique):
-        with open(sorted_unique, "r", encoding="utf-8") as f:
-            for line in f:
-                org, _sld = line.strip().split("|", 1)
-                counts[org] += 1
-        os.remove(sorted_unique)
-
-    # Load CIDR map and attach cidrs column
-    cidr_map_path = paths.get("cidr_map")
-    if not cidr_map_path:
-        raise ValueError("paths.cidr_map is required so Step 3 can embed CIDRs in its output")
-    hoster_cidrs = load_hoster_cidrs(cidr_map_path)
-
-    # Write final CSV (pipe-delimited)
     with open(out_csv, "w", newline="", encoding="utf-8") as out:
         w = csv.writer(out, delimiter="|")
         w.writerow(["Organization", "domaincount", "cidrs"])
-        for org, count in sorted(counts.items(), key=lambda x: -x[1]):
-            if count >= threshold:
-                cidrs = hoster_cidrs.get(org, [])
-                w.writerow([org, count, json.dumps(cidrs, ensure_ascii=False)])
+        for org, cnt in sorted(counts.items(), key=lambda x: (-x[1], x[0])):
+            if cnt >= threshold:
+                cidrs = cidrs_by_org.get(org, [])
+                # store as JSON array to keep a single cell
+                cidr_cell = json.dumps(cidrs, ensure_ascii=False)
+                w.writerow([org, cnt, cidr_cell])
 
-    logger.info("Step3: Wrote %s", out_csv)
 
-# CLI shim (optional)
-if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser(description="Step 3: Count unique SLDs and include CIDR lists")
-    ap.add_argument("--config", required=True, help="pipeline.yaml")
+# ---------- CLI / config ----------
+
+def count_unique_slds(config_path: str):
+    """
+    Retains CLI/API compatibility with previous name but now counts occurrences
+    (no dedup). Reads YAML config and runs the step.
+    """
+    try:
+        import yaml as _yaml
+    except ImportError as e:
+        raise RuntimeError("Install pyyaml: pip install pyyaml") from e
+
+    with open(config_path, "r", encoding="utf-8") as fh:
+        cfg = _yaml.safe_load(fh) or {}
+
+    paths = cfg.get("paths", {}) or {}
+    outputs = cfg.get("outputs", {}) or {}
+    params = cfg.get("params", {}) or {}
+
+    inputs_glob = os.path.join(paths.get("step2_out_dir", "data/work/step2"), "step3_enriched_*")
+    out_csv = outputs.get("orgs_over_threshold", "data/output/orgs.csv")
+    threshold = int(params.get("threshold_sld_count", 100))
+    cidr_map_path = paths.get("cidr_map")
+
+    if not cidr_map_path:
+        logger.warning("paths.cidr_map is not set; 'cidrs' column will be empty.")
+
+    count_sld_occurrences_from_args(inputs_glob, out_csv, threshold, cidr_map_path)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Step 3: Count SLD occurrences per org (no dedup).")
+    ap.add_argument("--inputs", default="data/work/step2/step3_enriched_*", help="Glob for Step 2 outputs")
+    ap.add_argument("--out", default="data/output/orgs.csv", help="Output pipe-delimited CSV")
+    ap.add_argument("--threshold", type=int, default=100, help="Minimum count to include")
+    ap.add_argument("--cidr-map", default=None, help="Path to hosters CIDR map (Organization|Ranges|...)")
     args = ap.parse_args()
-    count_unique_slds(args.config)
+
+    count_sld_occurrences_from_args(args.inputs, args.out, args.threshold, args.cidr_map)
+
+
+if __name__ == "__main__":
+    main()
