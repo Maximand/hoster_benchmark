@@ -1,11 +1,11 @@
-# HosterBenchmark: Modular Benchmarking Pipeline for Hosting Provider Analysis
+# 🧭 HosterBenchmark: Modular Benchmarking Pipeline for Hosting Provider Analysis
 
 **HosterBenchmark** is a modular, reproducible benchmarking pipeline for measuring security-related activity across hosting providers.  
 It extracts, enriches, counts, and correlates signals from large-scale datasets such as DNS records and abuse feeds to generate per-provider metrics on exposure, capacity, and abuse.
 
 ---
 
-## ⚙️Overview
+## ⚙️ Overview
 
 HosterBenchmark runs as a **six-step pipeline**, each modular and re-runnable:
 
@@ -22,7 +22,7 @@ The pipeline can be executed end-to-end or per step, driven by a simple YAML con
 
 ---
 
-## Repository structure
+## 🧩 Repository structure
 
 ```
 hoster_benchmark/
@@ -58,7 +58,7 @@ hoster_benchmark/
 ## 🔧 Installation
 
 ```bash
-git clone https://github.com/Maximand/hoster_benchmark.git
+git clone https://github.com/yourname/hoster_benchmark.git
 cd hoster_benchmark
 pip install -e .
 ```
@@ -67,6 +67,70 @@ This installs all dependencies (see `pyproject.toml`) and makes the CLI availabl
 
 ```bash
 python3 -m hosterbenchmark --help
+```
+
+---
+
+## 🗺️ Hosters file format (`config/hosters.txt`)
+
+HosterBenchmark expects a **pipe-delimited** file describing hosting providers and their IP address ranges.  
+This file is typically derived from **MaxMind’s GeoLite2 ASN or ISP database**, enriched with your own mappings.
+
+### ✅ Example (with header)
+
+```
+Organization|Ranges|Size|Country_hist
+Zeimudo Networks Ltd.|['1.3.3.0/24', '103.1.72.0/22']|1280|{'CN': 256, 'UA': 1024}
+ExampleHoster B.V.|["192.0.2.0/24","198.51.100.0/24"]|512|{'NL': 512}
+FastNet AB|203.0.113.0/24, 203.0.114.0/23|768|{'SE': 768}
+```
+
+### 🧩 Supported input variations
+
+The parser accepts several common formats for the `Ranges` field:
+
+| Format | Example | Accepted |
+|---------|----------|----------|
+| Python list | `['1.3.3.0/24', '103.1.72.0/22']` | ✅ |
+| JSON list | `["1.3.3.0/24","103.1.72.0/22"]` | ✅ |
+| Comma-separated | `1.3.3.0/24, 103.1.72.0/22` | ✅ |
+| Pipe-separated | `1.3.3.0/24 | 103.1.72.0/22` | ✅ |
+
+Additional fields (like `Size` or `Country_hist`) are **optional** and automatically ignored if not needed,  
+but can later be reintroduced in analytics or merged into final outputs if you pass `return_meta=True` in `load_hosters()`.
+
+### 📘 Minimal version (no header)
+
+```
+Zeimudo Networks Ltd.|1.3.3.0/24,103.1.72.0/22
+ExampleHoster B.V.|192.0.2.0/24,198.51.100.0/24
+FastNet AB|203.0.113.0/24
+```
+
+Both forms (with or without header) are accepted.
+
+### 🧠 How it’s used internally
+
+- **Step 2 (Enrichment)** and **Step 5 (Abuse Feed Ingestion)** both load this file via:
+
+```python
+from hosterbenchmark.feeds.parsers import load_hosters
+hosters = load_hosters("config/hosters.txt")
+```
+
+This returns:
+```python
+{
+  "Zeimudo Networks Ltd.": ["1.3.3.0/24", "103.1.72.0/22"],
+  "ExampleHoster B.V.": ["192.0.2.0/24", "198.51.100.0/24"],
+  ...
+}
+```
+
+If you also want metadata (e.g., `Size`, `Country_hist`):
+
+```python
+hosters, hoster_meta = load_hosters("config/hosters.txt", return_meta=True)
 ```
 
 ---
@@ -116,71 +180,7 @@ python3 -m hosterbenchmark run --config config/pipeline.yaml
 
 ---
 
-## Step-by-step details
-
-### Step 1 — Domain Extraction
-Extracts second-level domains (2LDs) and IPs from large DNSDB-style JSONL datasets.
-
-### Step 2 — Enrichment
-Maps extracted IPs to hosting providers via CIDR maps.
-
-### Step 3 — Unique SLD Counting
-Counts unique domains per hosting provider and exports CSV.
-
-### Step 4 — Capacity Computation
-Computes total address capacity and domain density.
-
-### Step 5 — Feed Ingestion
-Counts IP-only abuse feed hits per provider using LMDB-backed storage.
-
-### Step 6 — Merge
-Merges exposure, capacity, and abuse metrics into a unified benchmark dataset.
-
----
-
-## Configuration summary
-
-| Key | Description |
-|-----|-------------|
-| `paths.dnsdb_glob` | Input DNSDB files |
-| `paths.cidr_map` | Hosting provider → CIDR mapping |
-| `feeds_file` | Feed definition YAML |
-| `outputs.*` | Output file paths |
-| `params.threshold_sld_count` | Minimum SLDs per org |
-| `params.commit_every` | LMDB commit frequency |
-
----
-
-## Dummy Dataset
-
-The repository includes example data under `data/`:
-
-- 50 hosters (`config/hosters.txt`)
-- 100 DNSDB records (`data/dnsdb_dummy/sample.json.gz`)
-- 20 feed hits (`data/feeds/dummy_feed.csv`)
-
-Run:
-
-```bash
-python3 -m hosterbenchmark run --config config/pipeline.yaml
-```
-
----
-
-## Individual steps
-
-```bash
-python3 -m hosterbenchmark extract --config config/pipeline.yaml
-python3 -m hosterbenchmark enrich --config config/pipeline.yaml
-python3 -m hosterbenchmark slds --config config/pipeline.yaml
-python3 -m hosterbenchmark capacity --config config/pipeline.yaml
-python3 -m hosterbenchmark ingest --config config/pipeline.yaml
-python3 -m hosterbenchmark merge --config config/pipeline.yaml
-```
-
----
-
-## Outputs
+## 📊 Outputs
 
 | File | Description |
 |------|-------------|
@@ -191,7 +191,7 @@ python3 -m hosterbenchmark merge --config config/pipeline.yaml
 
 ---
 
-## Extending the Framework
+## 🧠 Extending the Framework
 
 Add new feed parsers by creating a class in `feeds/parsers.py`:
 
@@ -218,8 +218,13 @@ feeds:
 
 ---
 
-## License
+## 🧾 License
 
 MIT License — see `LICENSE`.
 
 ---
+
+## 👤 Author
+
+Developed by **Max van der Horst**  
+Part of ongoing research on hosting provider abuse governance and vulnerability disclosure under the TU Delft / EGOS project.
