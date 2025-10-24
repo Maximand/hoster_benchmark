@@ -1,3 +1,14 @@
 feeds:
-  - name: dummy_feed
-    path: data/feeds/dummy_feed.csv
+  - name: apwg_csv_ip
+    path: data/feeds/apwg/*.csv.gz
+  - name: dshield_daily
+    path: data/feeds/dshield/daily_sources.tsv.gz
+  - name: phishtank_json_ip
+    path: data/feeds/phishtank/*.json*
+  - name: shadowserver_csv_ip
+    path: data/feeds/shadowserver/*.csv.gz
+  - name: spamhaus_exbl_v4
+    path: data/feeds/spamhaus/exbl/*.json*
+  - name: threatfox_json_ip
+    path: data/feeds/threatfox/*.json*
+    
