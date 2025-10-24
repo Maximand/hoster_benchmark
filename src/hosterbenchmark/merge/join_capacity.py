@@ -22,7 +22,7 @@ _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"
 logger.addHandler(_handler)
 
 
-def merge_pipeline(cfg: dict) -> None:
+def merge_counts(cfg: dict) -> None:
     """Merge capacity and feed CSVs, dropping redundant identical columns."""
     outputs = cfg.get("outputs", {}) or {}
     cap_path = outputs.get("capacity_csv")
