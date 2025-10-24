@@ -98,8 +98,16 @@ def enrich_pairs_from_args(input_glob: str, hosters_path: str, out_dir: str, pro
 
     logger.info(f"Step2: enriching {len(files)} files with {processes} process(es)")
 
-    hosters = load_hosters(hosters_path)
-    ranges = [(cidr, org) for org, cidrs in hosters.items() for cidr in cidrs]
+    _loaded = load_hosters(hosters_path)
+    if isinstance(_loaded, tuple) and len(_loaded) == 2:
+        hosters, _meta = _loaded
+    else:
+        hosters, _meta = _loaded, {}
+
+    if not isinstance(hosters, dict):
+        raise TypeError(f"Expected dict from load_hosters(), got {type(hosters)}")
+
+    ranges = [(cidr, org) for org, cidrs in hosters.items() for cidr in (cidrs or [])]
 
     futs = []
     with ProcessPoolExecutor(max_workers=processes) as ex:
