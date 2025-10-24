@@ -402,14 +402,15 @@ class DShieldDaily_IPOnly(BaseFeedParser):
 class OpenPhishJSON_IPOnly(BaseFeedParser):
     """
     Accepts:
-      - JSONL: one JSON object per line, or
+      - JSONL: one JSON object OR a list of objects per line, or
       - JSON array: a single JSON array of objects.
 
     For each object, extracts IPs from:
       obj["details"][*]["ip_address"] (primary)
     Falls back to details[*]["ip"] or top-level "ip" if present.
 
-    Emits IP-only records (COUNT_DOMAINS=False).
+    Emits FeedRecord(domain=<first_ip>, ips=[...], timestamp=<epoch_or_None>, source=NAME)
+    COUNT_DOMAINS = False (IP-only).
     """
     NAME = "phishtank_json_ip"
     COUNT_DOMAINS = False
@@ -430,68 +431,90 @@ class OpenPhishJSON_IPOnly(BaseFeedParser):
             v = obj.get(key)
             if isinstance(v, str) and v.strip():
                 ips.append(v.strip())
-        valid = {x for x in (safe_ip(i) for i in ips) if x}
-        return sorted(valid)
+        return sorted({x for x in (safe_ip(i) for i in ips) if x})
 
     def _ts_from_obj(self, obj: dict) -> Optional[int]:
+        from datetime import datetime
         for key in ("submission_time", "verification_time", "detail_time"):
             raw = obj.get(key)
             if isinstance(raw, str) and raw.strip():
+                # normalize common variants
+                s = raw.strip().replace("Z", "+00:00")
                 try:
-                    dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
-                    return int(dt.timestamp())
+                    return int(datetime.fromisoformat(s).timestamp())
                 except Exception:
                     continue
         return None
 
-    def iter_records(self, path: str):
-        # Try JSONL streaming; if first line doesn't parse, try full file
-        tried_full = False
-        with open_maybe_gzip(path, "rt", encoding="utf-8", errors="ignore") as fh:
-            for line in fh:
-                s = line.strip()
-                if not s or s == ",":
-                    continue
-                try:
-                    obj = json.loads(s)
-                except Exception:
-                    tried_full = True
-                    break
-                ips = self._ips_from_obj(obj)
-                if not ips:
-                    continue
-                ts = self._ts_from_obj(obj)
-                yield {"domain": ips[0], "ips": ips, "timestamp": ts, "source": self.NAME}
-            else:
-                return  # consumed as JSONL
+    def _yield_from_items(self, items):
+        # Iterate a single dict or a list/tuple of dicts
+        if isinstance(items, dict):
+            items = [items]
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            ips = self._ips_from_obj(item)
+            if not ips:
+                continue
+            ts = self._ts_from_obj(item)
+            yield FeedRecord(domain=ips[0], ips=ips, timestamp=ts, source=self.NAME)
 
-        if tried_full:
-            with open_maybe_gzip(path, "rt", encoding="utf-8", errors="ignore") as fh2:
-                text = fh2.read().strip()
-                if not text:
-                    return
-                try:
-                    obj = json.loads(text)
-                except Exception:
-                    # attempt to wrap lines into array
-                    lines = [l.strip().rstrip(",") for l in text.splitlines() if l.strip()]
-                    arr_txt = "[" + ",".join(lines) + "]"
+    def iter_records(self, path: str):
+        import json
+        # Try JSONL first (allow each line to be a dict or list of dicts)
+        try:
+            with open_maybe_gzip(path, "rt") as fh:
+                saw_jsonl = False
+                for line in fh:
+                    s = line.strip()
+                    if not s or s in ("[", "]", ","):
+                        continue
                     try:
-                        obj = json.loads(arr_txt)
+                        obj = json.loads(s.rstrip(","))
                     except Exception:
-                        return
-                if isinstance(obj, dict):
-                    obj = [obj]
-                if not isinstance(obj, (list, tuple)):
+                        # Not valid JSON per-line → fall back to whole-file parse
+                        saw_jsonl = False
+                        break
+                    saw_jsonl = True
+                    for rec in self._yield_from_items(obj):
+                        yield rec
+                if saw_jsonl:
+                    return  # handled as JSONL
+        except Exception:
+            # fall through to whole-file parse
+            pass
+
+        # Whole-file JSON (array, dict, or dict-of-lists)
+        try:
+            with open_maybe_gzip(path, "rt") as fh:
+                text = fh.read().strip()
+            if not text:
+                return
+            try:
+                obj = json.loads(text)
+            except Exception:
+                # Attempt to coerce pretty-printed arrays with trailing commas
+                lines = [l.strip().rstrip(",") for l in text.splitlines() if l.strip()]
+                try:
+                    obj = json.loads("[" + ",".join(lines) + "]")
+                except Exception:
                     return
-                for item in obj:
-                    if not isinstance(item, dict):
-                        continue
-                    ips = self._ips_from_obj(item)
-                    if not ips:
-                        continue
-                    ts = self._ts_from_obj(item)
-                    yield {"domain": ips[0], "ips": ips, "timestamp": ts, "source": self.NAME}
+
+            # Dict-of-lists → flatten lists; plain list → use as-is; dict → single item
+            if isinstance(obj, dict):
+                items = []
+                for v in obj.values():
+                    if isinstance(v, list):
+                        items.extend(v)
+                    elif isinstance(v, dict):
+                        items.append(v)
+                for rec in self._yield_from_items(items):
+                    yield rec
+            else:
+                for rec in self._yield_from_items(obj):
+                    yield rec
+        except Exception:
+            return
 
 @register_feed
 class ShadowserverCSV_IPOnly(BaseFeedParser):
