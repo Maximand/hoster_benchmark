@@ -8,26 +8,11 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple, Callable, Any, Union
-
-# --------------------------------------------------------------------------------------
-# Registry & decorator
-# --------------------------------------------------------------------------------------
-
-FEED_REGISTRY: Dict[str, Any] = {}
-
-def register_feed(cls):
-    """
-    Class decorator that registers a parser class (or instance) under cls.NAME.
-    The class must implement:
-      - NAME: str
-      - COUNT_DOMAINS: bool
-      - iter_records(path: str) -> Iterable[dict]
-    """
-    name = getattr(cls, "NAME", None)
-    if not name:
-        raise ValueError(f"Cannot register feed without NAME: {cls}")
-    FEED_REGISTRY[name] = cls  # store the class; caller may instantiate
-    return cls
+import os
+import glob
+import ast
+from typing import Tuple
+import ipaddress
 
 # --------------------------------------------------------------------------------------
 # Helpers used by parsers (kept here to avoid import cycles)
@@ -100,6 +85,221 @@ def parse_ip_field(raw: Any) -> List[str]:
         if p:
             out.append(p)
     return out
+
+
+# -----------------------------
+# File expansion helper
+# -----------------------------
+def _expand_files(path: str) -> list:
+    """
+    Accepts:
+      - a single file path
+      - a directory (returns all files inside, non-recursive)
+      - a glob pattern (returns matches)
+    Returns a list of paths (may be empty).
+    """
+    if not path:
+        return []
+    p = path.strip()
+
+    # Glob wins first if there is a wildcard
+    if any(ch in p for ch in ("*", "?", "[")):
+        return sorted(glob.glob(p))
+
+    # If it's a directory, list files (non-recursive)
+    if os.path.isdir(p):
+        return sorted(
+            os.path.join(p, f)
+            for f in os.listdir(p)
+            if os.path.isfile(os.path.join(p, f))
+        )
+
+    # If it’s a file that exists, return it
+    if os.path.isfile(p):
+        return [p]
+
+    # Last resort: try glob anyway
+    return sorted(glob.glob(p))
+
+# -----------------------------
+# CIDR normalization helper
+# -----------------------------
+def _safe_cidr(s: str) -> str | None:
+    """
+    Normalize a CIDR/prefix; returns canonical string like '1.2.3.0/24'
+    or None if invalid.
+    """
+    if not s:
+        return None
+    s = s.strip().strip('"').strip("'")
+    if not s:
+        return None
+    try:
+        net = ipaddress.ip_network(s, strict=False)  # tolerate host bits set
+        return str(net.with_prefixlen)
+    except Exception:
+        return None
+
+def _parse_cidrs_field(raw: str | list | None) -> list[str]:
+    """
+    Accepts a field that might be:
+      - JSON string: '["1.2.3.0/24","4.5.6.0/23"]'
+      - Python-list string: "['1.2.3.0/24', '4.5.6.0/23']"
+      - Comma- or space-separated string: "1.2.3.0/24,4.5.6.0/23"
+      - A real list of strings
+    Returns a list of normalized CIDR strings (invalid entries dropped).
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        cand = [str(x) for x in raw]
+    else:
+        s = str(raw).strip()
+        if not s:
+            return []
+        # Try JSON
+        try:
+            val = json.loads(s)
+            if isinstance(val, (list, tuple)):
+                cand = [str(x) for x in val]
+            else:
+                cand = [s]
+        except Exception:
+            # Try Python literal list
+            try:
+                val = ast.literal_eval(s)
+                if isinstance(val, (list, tuple)):
+                    cand = [str(x) for x in val]
+                else:
+                    cand = [s]
+            except Exception:
+                # Fallback split on commas/spaces
+                sep = "," if "," in s else " "
+                cand = [p for p in (t.strip() for t in s.split(sep)) if p]
+    out = []
+    for c in cand:
+        norm = _safe_cidr(c)
+        if norm:
+            out.append(norm)
+    return out
+
+# -----------------------------
+# load_hosters()
+# -----------------------------
+def load_hosters(path: str) -> Tuple[dict[str, list[str]], dict[str, dict]]:
+    """
+    Load a MaxMind-derived org→CIDRs mapping AND return metadata per org.
+
+    Supports pipe- or comma-delimited files. Expected columns (flexible):
+      - Organization   (required)
+      - Ranges | cidrs | prefixes | prefix (any one; values can be JSON list,
+        Python list string, comma/space-separated)
+      - Size           (optional, int)
+      - Country_hist   (optional, JSON or Python dict string)
+
+    Returns:
+      (hosters, meta)
+       - hosters: { org_name: [cidr, cidr, ...] }
+       - meta:    { org_name: {"Size": int, "Country_hist": dict, "cidr_count": int} }
+    """
+    if not path or not os.path.isfile(path):
+        raise FileNotFoundError(f"hosters_file not found: {path}")
+
+    # Pick delimiter by peeking first line
+    with open_maybe_gzip(path, "rt", encoding="utf-8", errors="ignore") as fh:
+        first = fh.readline()
+        delim = "|" if ("|" in first and "," not in first) else ","
+
+    hosters: dict[str, list[str]] = {}
+    meta: dict[str, dict] = {}
+
+    with open_maybe_gzip(path, "rt", encoding="utf-8", errors="ignore") as fh:
+        rdr = csv.DictReader(fh, delimiter=delim)
+        # Normalize headers → lowercase for matching, but keep original for access
+        headers = rdr.fieldnames or []
+        lcmap = {h.lower(): h for h in headers}
+
+        def pick(*names: str) -> str | None:
+            for n in names:
+                if n.lower() in lcmap:
+                    return lcmap[n.lower()]
+            return None
+
+        col_org = pick("Organization", "org", "name")
+        col_ranges = pick("Ranges", "cidrs", "prefixes", "prefix")
+        col_size = pick("Size")
+        col_hist = pick("Country_hist", "country_hist", "countries")
+
+        if not col_org or not col_ranges:
+            raise ValueError(
+                f"Hosters CSV missing required columns. Have: {headers}. "
+                f"Need at least Organization and one of Ranges/cidrs/prefixes/prefix."
+            )
+
+        for row in rdr:
+            org = (row.get(col_org) or "").strip()
+            if not org:
+                continue
+            cidrs = _parse_cidrs_field(row.get(col_ranges))
+            if not cidrs:
+                # keep org present but empty list—upstream code tolerates it
+                cidrs = []
+            hosters[org] = cidrs
+
+            # metadata
+            size_val = row.get(col_size) if col_size else None
+            hist_val = row.get(col_hist) if col_hist else None
+
+            size = None
+            if size_val not in (None, ""):
+                try:
+                    size = int(str(size_val).strip())
+                except Exception:
+                    size = None
+
+            hist = {}
+            if hist_val not in (None, ""):
+                s = str(hist_val).strip()
+                # Try JSON then Python literal
+                try:
+                    val = json.loads(s)
+                    if isinstance(val, dict):
+                        hist = val
+                except Exception:
+                    try:
+                        val = ast.literal_eval(s)
+                        if isinstance(val, dict):
+                            hist = val
+                    except Exception:
+                        hist = {}
+
+            meta[org] = {
+                "Size": size if size is not None else "",
+                "Country_hist": hist,
+                "cidr_count": len(cidrs),
+            }
+
+    return hosters, meta
+
+# --------------------------------------------------------------------------------------
+# Registry & decorator
+# --------------------------------------------------------------------------------------
+
+FEED_REGISTRY: Dict[str, Any] = {}
+
+def register_feed(cls):
+    """
+    Class decorator that registers a parser class (or instance) under cls.NAME.
+    The class must implement:
+      - NAME: str
+      - COUNT_DOMAINS: bool
+      - iter_records(path: str) -> Iterable[dict]
+    """
+    name = getattr(cls, "NAME", None)
+    if not name:
+        raise ValueError(f"Cannot register feed without NAME: {cls}")
+    FEED_REGISTRY[name] = cls  # store the class; caller may instantiate
+    return cls
 
 # --------------------------------------------------------------------------------------
 # Base class (interface only; no inheritance required, but nice for consistency)
