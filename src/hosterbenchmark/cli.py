@@ -7,7 +7,7 @@ from hosterbenchmark.counts.capacity import compute_capacity
 from hosterbenchmark.feeds.runner import ingest_and_export
 from hosterbenchmark.merge.join_capacity import merge_counts
 
-app = typer.Typer(help="HosterBench pipeline")
+app = typer.Typer(help="HosterBenchmark pipeline")
 
 @app.command()
 def run(config: str = "config/pipeline.yaml"):

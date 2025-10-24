@@ -1,21 +1,55 @@
-paths:
-  dnsdb_glob: "data/dnsdb_dummy/*.json.gz"
-  step1_out_dir: "data/work/step1"
-  step2_out_dir: "data/work/step2"
-  tmpdir_step3: "data/work/tmp3"
-  lmdb_dir: "data/work/lmdb"
-  cidr_map: "config/hosters.txt"
+# Minimal pipeline config that works with Steps 1–6 and this runner.py.
+# Adjust paths to your environment.
 
-feeds_file: "config/feeds.yaml"
-hosters_file: "config/hosters.txt"
+paths:
+  # Step 1
+  dnsdb_glob: data/dnsdb_dummy/*.json.gz     # gzipped JSON lines from DNSDB-like export
+  step1_out_dir: data/work/step1
+
+  # Step 2
+  step2_out_dir: data/work/step2             # stores triplets "sld | ip | Organization"
+  # Optional override: a pipe-delimited CSV with sld|Organization (beats auto-derivation from Step 2)
+  # domain_map_csv: config/domain_map.csv
+
+  # Step 3
+  tmpdir_step3: data/work/tmp3
+
+  # Step 5
+  lmdb_dir: data/work/lmdb
+
+  # (Legacy alias, still used by some steps)
+  cidr_map: config/hosters.txt               # okay to point to the same as hosters_file
+
+# Feeds registry (Step 5 will read this file)
+feeds_file: config/feeds.yaml
+
+# Hoster/CIDR input (MaxMind-derived). Used by Step 2+5.
+# Accepts CSV or pipe-delimited; your project's `load_hosters` handles it.
+hosters_file: config/hosters.txt
 
 outputs:
-  orgs_over_threshold: "data/output/orgs.csv"
-  capacity_csv: "data/output/capacity.csv"
-  hoster_counts_csv: "data/output/feeds.csv"
-  merged_csv: "data/output/merged.csv"
+  # Step 3
+  orgs_over_threshold: data/output/orgs.csv
+
+  # Step 4
+  capacity_csv: data/output/capacity.csv
+
+  # Step 5
+  hoster_counts_csv: data/output/feeds.csv
+
+  # Step 6
+  merged_csv: data/output/merged.csv
 
 params:
+  # Step 1 / 2 / 3 concurrency etc.
+  processes: 1
+
+  # Step 3 threshold for including orgs in orgs_over_threshold
   threshold_sld_count: 1
-  commit_every: 5
+
+  # Step 5 LMDB and batching
+  commit_every: 5000
   lmdb_map_gb: 1
+
+  # Step 4 (if applicable)
+  include_ipv6: false

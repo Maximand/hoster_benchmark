@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Step 5 — Ingest IP-only abuse feeds and count hits per hoster.
+Step 5 — Ingest IP-only/domain-only abuse feeds and count hits per hoster.
 
 Inputs (from pipeline.yaml):
   - feeds_file: path to YAML with a 'feeds:' list of {name, path}
   - hosters_file: path to hoster/CIDR mapping (MaxMind-derived CSV/pipe)
   - paths.lmdb_dir: directory for LMDB environment
+  - paths.step2_out_dir: directory with Step-2 triplets (sld | ip | Organization)
+  - (optional) paths.domain_map_csv: pipe-delimited CSV with: sld|Organization
 
 Also carries forward Step 4 capacity metrics by reading:
   - outputs.capacity_csv
@@ -18,22 +20,23 @@ from __future__ import annotations
 
 import os
 import csv
+import glob
 import argparse
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
+from collections import defaultdict, Counter
 
 try:
     import yaml
 except ImportError:
     yaml = None
 
+# Parsers & store/processor primitives exposed by your project
 from hosterbenchmark.feeds.parsers import (
-    FEED_REGISTRY,
-    load_hosters,   # returns dict[str, list[str]]  hoster -> [cidrs...]
-    _expand_files,   # glob/dir expansion helper
+    FEED_REGISTRY,     # dict: feed_name -> parser class/instance
+    load_hosters,      # returns dict[str, list[str]] OR (dict[str, list[str]], meta)
 )
 from hosterbenchmark.feeds.store import Store, Processor
-
 
 logger = logging.getLogger("hosterbenchmark.step5")
 logger.setLevel(logging.INFO)
@@ -43,7 +46,7 @@ logger.addHandler(_handler)
 
 
 # -------------------------------------------------------------------
-# Helpers
+# Small helpers
 # -------------------------------------------------------------------
 
 def _load_yaml(fp: str) -> dict:
@@ -53,9 +56,26 @@ def _load_yaml(fp: str) -> dict:
         return yaml.safe_load(fh) or {}
 
 
+def _expand_files(path: str) -> List[str]:
+    """Accept a file, dir, or glob; return a list of files."""
+    if not path:
+        return []
+    # glob?
+    if any(ch in path for ch in ["*", "?", "["]):
+        return [p for p in glob.glob(path) if os.path.isfile(p)]
+    # dir?
+    if os.path.isdir(path):
+        out = []
+        for root, _dirs, files in os.walk(path):
+            out.extend([os.path.join(root, f) for f in files])
+        return out
+    # file
+    return [path] if os.path.isfile(path) else []
+
+
 def _load_capacity_map(capacity_csv: str) -> Dict[str, dict]:
     """
-    Load step4 capacity so we can carry its columns into the final CSV even
+    Load Step 4 capacity so we can carry its columns into the final CSV even
     when no feeds are ingested.
 
     Returns: { hoster: row_dict }
@@ -77,6 +97,88 @@ def _load_capacity_map(capacity_csv: str) -> Dict[str, dict]:
     return out
 
 
+def _load_domain_map(csv_path: str) -> Dict[str, str]:
+    """
+    Optional explicit domain map file (pipe-delimited):
+      sld|Organization
+    Returns dict: sld_lower -> Organization
+    """
+    m: Dict[str, str] = {}
+    if not csv_path or not os.path.isfile(csv_path):
+        return m
+    with open(csv_path, "r", encoding="utf-8", newline="") as fh:
+        rdr = csv.DictReader(fh, delimiter="|")
+        required = {"sld", "Organization"}
+        if not set(rdr.fieldnames or ()) >= required:
+            raise ValueError(
+                f"{csv_path} must have pipe-delimited columns: sld|Organization"
+            )
+        for r in rdr:
+            sld = (r.get("sld") or "").strip().lower()
+            org = (r.get("Organization") or "").strip()
+            if sld and org:
+                m[sld] = org
+    logger.info(f"Step 5: loaded {len(m)} sld->org mappings from {csv_path}")
+    return m
+
+
+def _build_sld_org_from_step2(step2_out_dir: Optional[str]) -> Dict[str, str]:
+    """
+    Build sld->Organization map from Step 2 triplet files:
+      <sld> | <ip> | <Organization>
+
+    We look for:  step3_enriched_*.txt  inside step2_out_dir
+    If multiple orgs appear for the same sld, we keep the most frequent one.
+    """
+    m: Dict[str, str] = {}
+    if not step2_out_dir:
+        return m
+
+    pattern = os.path.join(step2_out_dir, "step3_enriched_*.txt")
+    files = sorted(glob.glob(pattern))
+    if not files:
+        logger.info(f"Step 5: no Step 2 files matching {pattern}; domain inference from Step 2 disabled.")
+        return m
+
+    counts: Dict[str, Counter] = defaultdict(Counter)
+
+    for fp in files:
+        try:
+            with open(fp, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    # "<sld> | <ip> | <Organization>"
+                    parts = [p.strip() for p in line.rstrip("\n").split("|")]
+                    if len(parts) < 3:
+                        continue
+                    sld, _ip, org = parts[0], parts[1], parts[2]
+                    if not sld or not org:
+                        continue
+                    counts[sld.lower()][org] += 1
+        except Exception as e:
+            logger.warning(f"Step 5: failed reading {fp}: {e}")
+
+    for sld, counter in counts.items():
+        org, _ = counter.most_common(1)[0]
+        m[sld] = org
+
+    logger.info(f"Step 5: built {len(m)} sld->org mappings from Step 2 outputs")
+    return m
+
+
+def _sld(domain: str) -> str:
+    """
+    Heuristic SLD extraction: take last two labels.
+    (Good enough for feeds attribution since Step-2 triplets already use this form.)
+    """
+    if not domain:
+        return ""
+    d = domain.strip(".").lower()
+    parts = [p for p in d.split(".") if p]
+    if len(parts) < 2:
+        return d
+    return ".".join(parts[-2:])
+
+
 # -------------------------------------------------------------------
 # Core
 # -------------------------------------------------------------------
@@ -84,7 +186,6 @@ def _load_capacity_map(capacity_csv: str) -> Dict[str, dict]:
 def ingest_and_export(config_path: str) -> None:
     cfg = _load_yaml(config_path)
 
-    # Required paths/outputs
     feeds_conf   = cfg.get("feeds_file")
     hosters_file = cfg.get("hosters_file")
     outputs      = cfg.get("outputs", {}) or {}
@@ -93,6 +194,7 @@ def ingest_and_export(config_path: str) -> None:
 
     lmdb_dir     = paths.get("lmdb_dir")
     output_csv   = outputs.get("hoster_counts_csv")
+    capacity_csv = outputs.get("capacity_csv", "")
     commit_every = int(params.get("commit_every", 10000))
     lmdb_map_gb  = int(params.get("lmdb_map_gb", 64))
 
@@ -107,23 +209,39 @@ def ingest_and_export(config_path: str) -> None:
 
     # Load hosters → [cidrs...]
     logger.info("Step 5: loading hosters...")
-    hosters, _meta = load_hosters(hosters_file) if isinstance(load_hosters(hosters_file), tuple) else (load_hosters(hosters_file), {})
+    loaded = load_hosters(hosters_file)
+    if isinstance(loaded, tuple):
+        hosters, _meta = loaded
+    else:
+        hosters, _meta = loaded, {}
     all_hoster_names = list(hosters.keys())
 
-    # Carry forward Step 4 capacity (optional but recommended)
-    capacity_csv = outputs.get("capacity_csv", "")
-    capacity_map = _load_capacity_map(capacity_csv)  # hoster -> row dict (from capacity)
+    # Carry forward Step 4 capacity
+    capacity_map = _load_capacity_map(capacity_csv)
 
-    # Load feed list
+    # Domain attribution map: explicit CSV beats implicit-from-step2
+    domain_map_csv = paths.get("domain_map_csv", "")
+    if domain_map_csv and os.path.isfile(domain_map_csv):
+        domain_map = _load_domain_map(domain_map_csv)
+    else:
+        domain_map = _build_sld_org_from_step2(paths.get("step2_out_dir"))
+
+    # Prepare store/processor
+    logger.info("Step 5: opening LMDB...")
+    store = Store(lmdb_dir, map_size_gb=lmdb_map_gb)
+
+    # FEED_POLICY: detect whether a feed counts domains distinctly or is IP-only
+    feed_policy: Dict[str, bool] = {}
+
+    # Parse feeds.yaml
     logger.info("Step 5: loading feeds...")
     with open(feeds_conf, "r", encoding="utf-8") as fh:
         feeds_yaml = yaml.safe_load(fh) or {}
     feeds_list = feeds_yaml.get("feeds", []) or []
 
-    # Build list of (feed_name, path) we can actually run, and derive feed policy
+    # Build concrete feed list
     feed_specs: List[Tuple[str, str]] = []
     feeds_to_report: List[str] = []
-    feed_policy: Dict[str, bool] = {}  # feed_name -> COUNT_DOMAINS (True = supports domain/IP split; False = IP-only)
 
     for item in feeds_list:
         name = item.get("name")
@@ -135,14 +253,12 @@ def ingest_and_export(config_path: str) -> None:
             continue
 
         parser_entry = FEED_REGISTRY[name]
-        # Try to get COUNT_DOMAINS flag from class or instance
+        # Discover COUNT_DOMAINS flag (True means domains+IPs available)
         count_domains = True
         try:
-            # If it's a class or object with attribute
             if hasattr(parser_entry, "COUNT_DOMAINS"):
                 count_domains = bool(getattr(parser_entry, "COUNT_DOMAINS"))
             else:
-                # If it's a constructor, instantiate to inspect
                 maybe_inst = parser_entry() if callable(parser_entry) else parser_entry
                 if hasattr(maybe_inst, "COUNT_DOMAINS"):
                     count_domains = bool(getattr(maybe_inst, "COUNT_DOMAINS"))
@@ -153,9 +269,7 @@ def ingest_and_export(config_path: str) -> None:
         feed_specs.append((name, path))
         feeds_to_report.append(name)
 
-    logger.info("Step 5: opening LMDB...")
-    store = Store(lmdb_dir, map_size_gb=lmdb_map_gb)
-    # Your Processor signature requires a feed_policy third arg
+    # Processor(hosters, store, feed_policy) — this matches your current signature
     proc = Processor(hosters, store, feed_policy)
 
     # Ingest feeds (if any)
@@ -166,11 +280,11 @@ def ingest_and_export(config_path: str) -> None:
         parser_entry = FEED_REGISTRY[feed_name]
         # Resolve an instance with .iter_records(file_path)
         if hasattr(parser_entry, "iter_records"):
-            parser = parser_entry  # already an instance-like object
+            parser = parser_entry  # instance-like
         elif callable(parser_entry):
-            parser = parser_entry()  # construct instance
+            parser = parser_entry()  # construct
         else:
-            raise TypeError(f"FEED_REGISTRY['{feed_name}'] must be a class/instance with iter_records()")
+            raise TypeError(f"FEED_REGISTRY['{feed_name}'] must provide iter_records(file)")
 
         files = _expand_files(path)
         logger.info(f"[{feed_name}] Found {len(files)} files matching {path}")
@@ -178,8 +292,22 @@ def ingest_and_export(config_path: str) -> None:
             logger.info(f"[{feed_name}] Processing {f}")
             try:
                 for rec in parser.iter_records(f):
-                    # rec should be a dict like: {"ip": "1.2.3.4", "source": feed_name, "domain": optional}
-                    proc.ingest_record(rec, txn)
+                    # Expecting dicts like: {"ip": "1.2.3.4"} or {"domain": "example.com"} or both.
+                    ip = (rec.get("ip") or "").strip()
+                    dom = (rec.get("domain") or "").strip()
+                    src = feed_name
+
+                    if dom and not ip and domain_map:
+                        s = _sld(dom)
+                        mapped_org = domain_map.get(s)
+                        if mapped_org:
+                            # force attribution via _org for domain-only hits
+                            proc.ingest_record({"domain": dom, "source": src, "_org": mapped_org}, txn)
+                        # else: un-attributable domain-only; skip
+                    else:
+                        # normal path; Processor will attribute IPs via CIDRs and domains via its own logic
+                        proc.ingest_record({"ip": ip, "domain": dom, "source": src}, txn)
+
                     n += 1
                     if n % commit_every == 0:
                         txn.commit()
@@ -195,11 +323,8 @@ def ingest_and_export(config_path: str) -> None:
     # Build final CSV (feeds + seen/shared + capacity carry-forward)
     # -------------------------------------------------------------------
     logger.info("Step 5: generating output CSV...")
-    # Header: feed columns + store summary + capacity columns
     header = ["hoster"]
     for feed in feeds_to_report:
-        # if COUNT_DOMAINS True, your Processor might track both domains and ips;
-        # but to keep stable, we always at least output *_ips
         header.append(f"{feed}_ips")
     header += ["domaincount_seen", "ipcount_seen", "ipcount_shared", "domaincount_shared"]
     cap_cols = ["domaincount", "cidr_count", "total_ips", "avg_domains_per_ip", "cidrs"]
@@ -211,7 +336,7 @@ def ingest_and_export(config_path: str) -> None:
     except Exception:
         perfeed_ips = {}
 
-    # Overall counts
+    # Overall counts accumulated in the store
     try:
         domaincount_seen = store.count_dups(store.db_hoster_domains)
     except Exception:
@@ -232,6 +357,7 @@ def ingest_and_export(config_path: str) -> None:
     names_from_hosters = all_hoster_names
     all_names = sorted(set(names_from_capacity) | set(names_from_hosters))
 
+    # Write CSV
     with open(output_csv, "w", newline="", encoding="utf-8") as outfh:
         w = csv.writer(outfh)
         w.writerow(header)
@@ -239,7 +365,7 @@ def ingest_and_export(config_path: str) -> None:
         for hoster in all_names:
             row = [hoster]
 
-            # feed columns
+            # per-feed columns
             for feed in feeds_to_report:
                 row.append(str(perfeed_ips.get((hoster, feed), 0)))
 
@@ -262,7 +388,7 @@ def ingest_and_export(config_path: str) -> None:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Step 5: Ingest IP-only feeds and count per hoster")
+    ap = argparse.ArgumentParser(description="Step 5: Ingest IP/domain feeds and count per hoster")
     ap.add_argument("--config", required=True, help="Path to pipeline.yaml")
     args = ap.parse_args()
     ingest_and_export(args.config)
