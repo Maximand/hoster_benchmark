@@ -14,7 +14,6 @@ from __future__ import annotations
 import os
 import logging
 from typing import Union, Dict, Any
-
 import pandas as pd
 
 try:
@@ -28,6 +27,10 @@ _handler = logging.StreamHandler()
 _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
 logger.addHandler(_handler)
 
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
 
 def _load_cfg(config_path_or_dict: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
     """Accept either a config dict or a path to YAML and return a dict."""
@@ -54,17 +57,20 @@ def _normalize_join_key(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
+
 def merge_counts(config_path_or_dict: Union[str, Dict[str, Any]]) -> None:
     """
-    Merge capacity and feed CSVs, dropping redundant identical columns.
-
-    Accepts either a loaded config dict or a path to pipeline.yaml.
+    Merge capacity and feed CSVs, dropping redundant identical columns
+    and cleaning suffixes (_x/_y).
     """
     cfg = _load_cfg(config_path_or_dict)
     outputs = cfg.get("outputs", {}) or {}
 
     cap_path = outputs.get("capacity_csv")
-    feed_path = outputs.get("hoster_counts_csv") or outputs.get("feeds_csv")  # tolerate older naming
+    feed_path = outputs.get("hoster_counts_csv") or outputs.get("feeds_csv")
     out_path = outputs.get("merged_csv")
 
     if not cap_path or not feed_path or not out_path:
@@ -87,8 +93,9 @@ def merge_counts(config_path_or_dict: Union[str, Dict[str, Any]]) -> None:
 
     merged = pd.merge(cap_df, feed_df, on="Organization", how="outer", suffixes=("_x", "_y"))
 
-    # Drop redundant identical *_y columns when *_x and *_y match exactly
+    # Drop redundant identical *_y columns; keep *_x and rename it back
     to_drop = []
+    to_rename = {}
     for col in merged.columns:
         if col.endswith("_x"):
             base = col[:-2]
@@ -96,15 +103,25 @@ def merge_counts(config_path_or_dict: Union[str, Dict[str, Any]]) -> None:
             if twin in merged.columns:
                 if merged[col].equals(merged[twin]):
                     to_drop.append(twin)
+                    to_rename[col] = base  # rename the kept _x column back to original
                 else:
                     logger.warning(f"Column '{base}' differs between capacity and feeds; keeping both")
+            else:
+                # no twin, rename to base anyway for clarity
+                to_rename[col] = base
+
     if to_drop:
-        logger.info(
-            f"Dropping {len(to_drop)} redundant identical columns: "
-            + ", ".join(to_drop[:6])
-            + ("..." if len(to_drop) > 6 else "")
-        )
+        logger.info(f"Dropping {len(to_drop)} redundant identical columns: {', '.join(to_drop[:6])}{'...' if len(to_drop)>6 else ''}")
         merged.drop(columns=to_drop, inplace=True)
+
+    if to_rename:
+        merged.rename(columns=to_rename, inplace=True)
+
+    # Final cleanup: drop any lingering '_y' columns that were unmatched but empty
+    y_cols = [c for c in merged.columns if c.endswith("_y") and merged[c].isna().all()]
+    if y_cols:
+        logger.info(f"Dropping empty trailing columns: {', '.join(y_cols)}")
+        merged.drop(columns=y_cols, inplace=True)
 
     # Write output
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
